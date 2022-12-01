@@ -95,6 +95,8 @@ Paths::Paths(std::istream &is) : Graph(is), leader_max_earn_{0} {
     cerr << "-------------Q POLYHEDRA READING IN-------------" << endl;
     #endif
 
+	char varname[20];
+
 	//Q
 		int lines; is >> lines;
         //IloNumVarArray q(env); 
@@ -113,6 +115,7 @@ Paths::Paths(std::istream &is) : Graph(is), leader_max_earn_{0} {
 		}
 
 	#if _DEBUG
+	
 	IloCplex cplex(polyhedra_q_);
 	cplex.exportModel("PROBLEM_Q.lp");
 	cplex.end();
@@ -125,7 +128,8 @@ Paths::Paths(std::istream &is) : Graph(is), leader_max_earn_{0} {
 		FOR(i,people_n_) {
 			u_[i] = IloNumVarArray(env, edge_number_);
 			FOR(j,edge_number_) {
-				u_[i][j] = IloNumVar(env, 0., +IloInfinity, ILOFLOAT);
+				sprintf(varname, "u_%d%d", i, j);
+				u_[i][j] = IloNumVar(env, 0., +IloInfinity, ILOFLOAT, varname);
 			}
 		}
 		
@@ -144,6 +148,7 @@ Paths::Paths(std::istream &is) : Graph(is), leader_max_earn_{0} {
 		}
 		
 	#if _DEBUG
+	
 	IloCplex cplex2(polyhedra_u_);
 	cplex2.exportModel("PROBLEM_U.lp");
 	cplex2.end();
@@ -158,17 +163,78 @@ Paths::~Paths() {
     env.end();
 }
 
-void Paths::InitialQValue(std::ostream &os) {
+void Paths::PerturbationOfq(vector<double> &q_tariff, const double delta, std::ostream &os) const{
+	#if _DEBUG
+    cerr << "\n\n-------PerturbationOfq BEGIN-------" << endl;
+    #endif
+
+	std::vector<pair<double, int>> q_indexed;
+	int ind{0};
+	std::transform(all(q_tariff), std::back_inserter(q_indexed),
+		[&ind, this](double &a)
+		{return std::make_pair(a-arc_buy_p_[g.arcFromId(ind)], ind++);});
+
+	#if _DEBUG
+	cerr << "\n q_tariff indexed\n";
+	Print_vector_pairs(q_indexed);
+	#endif
+
+	std::sort(all(q_indexed));
+
+	#if _DEBUG
+	cerr << "\n Sorted q_indexed\n";
+	Print_vector_pairs(q_indexed);
+	#endif
+
+	int first_non_negative = (*std::find_if(all(q_indexed), [](auto &a){return a.first > 0;})).second;
+	//assert( != end());
+
+	#if _DEBUG
+	cerr << "\nFirst index T star: " << first_non_negative << endl;
+	#endif
+
+	std::transform(all(q_indexed), q_indexed.begin(), 
+		[this, first_non_negative, delta](auto &a)
+		{return std::make_pair(a.first + arc_buy_p_[g.arcFromId(a.second)] - (a.second-first_non_negative + 1./2.)*delta, a.second); });
+	
+	#if _DEBUG
+	cerr << "\n Applied perturbation\n";
+	Print_vector_pairs(q_indexed);
+	#endif
+
+	std::sort(all(q_indexed), [](auto &a, auto &b){return a.second < b.second; });
+
+	#if _DEBUG
+	cerr << "\nSort according to original order\n";
+	Print_vector_pairs(q_indexed);
+	#endif
+
+	std::transform(all(q_indexed), q_tariff.begin(), [this](auto &a){return a.first + arc_buy_p_[g.arcFromId(a.second)];});
+
+	#if _DEBUG
+    cerr << "\n\n-------PerturbationOfq END-------" << endl;
+    #endif
+}
+
+void Paths::InitialQValue(vector<double> &q_tariff, std::ostream &os) const{
 	//Getting a q tariff that satisfies the constraints
+
+	#if _DEBUG
+    cerr << "\n\n-------InitialQValue BEGIN-------" << endl;
+    #endif
+
+	IloModel poly_q(env); poly_q.add(polyhedra_q_); 
 
 	IloExpr expr(env); FOR(i,q_.getSize()) expr += q_[i];
 	IloObjective obj(env, expr, IloObjective::Maximize);
-
-	IloModel poly_q(env); poly_q.add(polyhedra_q_); poly_q.add(obj);
+	poly_q.add(obj);
+	
 	IloCplex cplex_q(poly_q);
+
 	#if _DEBUG
     //cplex_q.exportModel("PROBLEM_InitialQValue.lp");
     #endif
+
 	cplex_q.solve();
 	if(cplex_q.getStatus() == IloAlgorithm::Optimal) {
         IloNumArray qr(env); cplex_q.getValues(qr, q_);
@@ -176,7 +242,8 @@ void Paths::InitialQValue(std::ostream &os) {
 		os << "The solution is for a sample q value:" << qr << endl;
 		#endif
 		FOR(i,qr.getSize()) {
-			arc_cost_q_[g.arcFromId(i)] = qr[i];
+			//arc_cost_q_[g.arcFromId(i)] = qr[i];
+			q_tariff.push_back(qr[i]);
 		}
 		qr.end();
     }
@@ -186,44 +253,48 @@ void Paths::InitialQValue(std::ostream &os) {
 	obj.end();
 	poly_q.end();
 	cplex_q.end();
+
+	#if _DEBUG
+    cerr << "\n\n-------InitialQValue END-------" << endl;
+    #endif
 }
 
 double Paths::MinimizeLeadersEarning(const vector<double> &q_tariff, const int big_M, std::ostream &os) {
 	//Given the tariff's on the roads, it gives the worst case for the leader.
 	//Rerturn's the leader's minimal earning
 	#if _DEBUG
-    cerr << "\n\n-------MinimizeLeadersEarning-------" << endl;
+    cerr << "\n\n-------MinimizeLeadersEarning BEGIN-------" << endl;
     #endif
+	char varname[20]; //Nameing the variables of cplex
+	int bound_flow_binary{2}; //for inequalities with binary constraints bounding the flow type expressions
 
 	IloModel model(env);
 	// u \in U
-		model.add(polyhedra_u_);
+		model.add(polyhedra_u_); //Hindering utilities
 	#if _DEBUG
     cerr << "-------IMPORTED POLYHEDRA U-------" << endl;
     #endif
 
-	NumVarMatrix x(env, people_n_);
+	NumVarMatrix x(env, people_n_); //Flow
 	FOR(i,people_n_) {
 		x[i] = IloNumVarArray(env, edge_number_);
 		FOR(j,edge_number_) {
-			x[i][j] = IloNumVar(env, 0., 1., ILOFLOAT);
+			sprintf(varname, "x_%d%d", i, j);
+			x[i][j] = IloNumVar(env, 0., 1., ILOFLOAT, varname);
 		}
 	}
 
 	#if _DEBUG
     cerr << "-------DEFINING X-------" << endl;
-	/*
-	IloCplex cplex1(model);
-	cplex1.exportModel("PROBLEM_1.lp");
-	cplex1.end();
-    cerr << "-------------PROBLEM1-------------" << endl;*/
     #endif
 
 	IloNumVarArray alpha_plus(env, people_n_);
 	IloNumVarArray alpha_negative(env, people_n_);
-	FOR(i,alpha_plus.getSize()) {
-		alpha_plus[i] = IloNumVar(env, 0., +INFINITY, ILOFLOAT);
-		alpha_negative[i] = IloNumVar(env, 0., +INFINITY, ILOFLOAT);
+	FOR(i,people_n_) {
+		sprintf(varname, "ap_%d", i);
+		alpha_plus[i] = IloNumVar(env, 0., +INFINITY, ILOFLOAT, varname);
+		sprintf(varname, "an_%d", i);
+		alpha_negative[i] = IloNumVar(env, 0., +INFINITY, ILOFLOAT, varname);
 
 		//a_plus >= 0 and x_j(\rho(t_j)) >= 1
 			IloExpr expr(env);
@@ -232,10 +303,11 @@ double Paths::MinimizeLeadersEarning(const vector<double> &q_tariff, const int b
 				expr += x[i][g.id(a)];
 			}
 			model.add(expr >= 1);
-			
-			IloNumVar helper(env, 0, 1, ILOINT);
+
+			sprintf(varname, "hap_1_%d", i);
+			IloNumVar helper(env, 0, 1, ILOINT, varname);
 			model.add(alpha_plus[i] <= helper*big_M);
-			model.add(expr-1 <= (1-helper)*big_M);
+			model.add(expr-1 <= (1-helper)*bound_flow_binary);
 			//helper.end();
 			expr.end();
 			
@@ -250,9 +322,10 @@ double Paths::MinimizeLeadersEarning(const vector<double> &q_tariff, const int b
 			}
 			model.add(expr_2+1 >= 0);
 			
-			IloNumVar helper_2(env, 0, 1, ILOINT);
+			sprintf(varname, "han_2_%d", i);
+			IloNumVar helper_2(env, 0, 1, ILOINT, varname);
 			model.add(alpha_negative[i] <= helper_2*big_M);
-			model.add(expr_2+1 <= (1-helper_2)*big_M);
+			model.add(expr_2+1 <= (1-helper_2)*bound_flow_binary);
 			expr_2.end();
 			
 
@@ -260,33 +333,6 @@ double Paths::MinimizeLeadersEarning(const vector<double> &q_tariff, const int b
 
 	#if _DEBUG
     cerr << "-------ALPHAS DEFINED-------" << endl;
-	
-	IloCplex cplex_2(model);
-	cplex_2.exportModel("PROBLEM_2.lp");
-	cplex_2.end();
-    cerr << "-------------PROBLEM_2-------------" << endl;
-    #endif
-
-	NumVarMatrix gamma(env, people_n_);
-	FOR(i,people_n_) {
-		gamma[i] = IloNumVarArray(env, edge_number_);
-		FOR(j,edge_number_) {
-			gamma[i][j] = IloNumVar(env, 0., +IloInfinity, ILOFLOAT);
-			IloNumVar helper(env, 0, 1, ILOINT);
-			model.add(gamma[i][j] <= helper*big_M); //\gamma_{j,e}
-			IloExpr expr_t = 1 - x[i][j];
-			model.add(expr_t <= (1-helper)*big_M); //-x_j(e)+1 \geq 0
-		}
-	}
-
-
-	#if _DEBUG
-    cerr << "-------GAMMA DEFINED-------" << endl;
-	
-	IloCplex cplex_3(model);
-	cplex_3.exportModel("PROBLEM_3.lp");
-	cplex_3.end();
-    cerr << "-------------PROBLEM_3-------------" << endl;
     #endif
 	
 	vector<map<int,IloNumVar>> beta(people_n_);
@@ -294,7 +340,8 @@ double Paths::MinimizeLeadersEarning(const vector<double> &q_tariff, const int b
 		FOR(v,n_) {
 			ListDigraph::Node curr_v = g.nodeFromId(v);
 			if(paths_[j].first != v && paths_[j].second != v) {
-				beta[j][v] = IloNumVar(env, 0., +IloInfinity, ILOFLOAT);
+				sprintf(varname, "b_%d%d", j, v);
+				beta[j][v] = IloNumVar(env, 0., +IloInfinity, ILOFLOAT, varname);
 				//beta[i].insert({j,IloNumVar(env, 0., +IloInfinity, ILOFLOAT)});
 				IloExpr expr(env);
 				int is_there{0};
@@ -309,9 +356,10 @@ double Paths::MinimizeLeadersEarning(const vector<double> &q_tariff, const int b
 				if(is_there) {
 					model.add(expr >= 0);
 
-					IloNumVar helper(env, 0, 1, ILOINT);
+					sprintf(varname, "hb_%d%d", j, v);
+					IloNumVar helper(env, 0, 1, ILOINT, varname);
 					model.add(beta[j][v] <= helper*big_M);
-					model.add(expr <= (1-helper)*big_M);
+					model.add(expr <= (1-helper)*bound_flow_binary);
 					//helper.end();
 				}
 				
@@ -323,10 +371,6 @@ double Paths::MinimizeLeadersEarning(const vector<double> &q_tariff, const int b
 
 	#if _DEBUG
     cerr << "-------BETA DEFINED-------" << endl;
-	IloCplex cplex_4(model);
-	cplex_4.exportModel("PROBLEM_4.lp");
-	cplex_4.end();
-    cerr << "-------------PROBLEM_4-------------" << endl;
     #endif
 
 	FOR(j,people_n_) {
@@ -335,32 +379,33 @@ double Paths::MinimizeLeadersEarning(const vector<double> &q_tariff, const int b
 			int source = g.id(g.source(g.arcFromId(e))); int target = g.id(g.target(g.arcFromId(e)));
 			if(target == paths_[j].second) expr += alpha_plus[j];
 			if(source == paths_[j].first) expr -= alpha_negative[j];
-			expr -= gamma[j][e];
-			//+ beta[j][g.id(g.target(g.arcFromId(e)))] - beta[j][g.id(g.source(g.arcFromId(e)))] 
+			
 			if(paths_[j].first != target && paths_[j].second != target) {
 				expr += beta[j][target];
 			}
 			if(paths_[j].first != source && paths_[j].second != source) {
 				expr -= beta[j][source];
 			}
-			model.add(expr == q_tariff[e]- u_[j][e]);
+			expr -= q_tariff[e] + u_[j][e];
+			model.add(expr <= 0);
+
+			sprintf(varname, "hdu_%d%d", j, e);
+			IloNumVar helper(env, 0, 1, ILOINT, varname);
+			model.add(x[j][e] <= helper*bound_flow_binary);
+			model.add(-expr <= (1-helper)*big_M);
 			expr.end();
 		}
 	}
 
 	#if _DEBUG
     cerr << "-------DUAL OPTIMALITY DEFINED-------" << endl;
-	IloCplex cplex_5(model);
-	cplex_5.exportModel("PROBLEM_5.lp");
-	cplex_5.end();
-    cerr << "-------------PROBLEM_5-------------" << endl;
     #endif
 
 	
 	IloExpr expr_obj(env);
 	FOR(i,people_n_) {
-		FOR(j,edge_number_) {
-			expr_obj += q_tariff[j]*x[i][j];
+		FOR(e,edge_number_) {
+			expr_obj += q_tariff[e]*x[i][e];
 		}
 	}
 	IloObjective obj(env, expr_obj, IloObjective::Minimize);
@@ -378,32 +423,6 @@ double Paths::MinimizeLeadersEarning(const vector<double> &q_tariff, const int b
 
 	cplex.solve();
 	double obj_value{0};
-	/*
-	if(cplex.getStatus() == IloAlgorithm::Optimal) {
-		try{
-			NumMatrix ur(env); ur.setSize(people_n_);
-			FOR(i,people_n_) {
-				ur[i] = IloNumArray(env, edge_number_);
-				cplex.getValues(ur[i], u_[i]);
-			}
-
-			if(true) {//TODO
-				set_of_utilities_.push_back(ur);
-			}
-
-			#if _DEBUG
-			os << "The solution for u is:\n";
-			FOR(i,people_n_)
-				os << ur[i] << endl;
-			#endif
-
-			obj_value = cplex.getObjValue();
-		}
-		catch(IloAlgorithm::NotExtractedException) {
-			cerr << "IPSOLVE34 VARIABLES ARE NOT RELATED TO THE OBJECTIVE\n"; 
-		}
-    }
-	*/
 	switch (cplex.getStatus())
 	{
 
@@ -414,8 +433,7 @@ double Paths::MinimizeLeadersEarning(const vector<double> &q_tariff, const int b
 				ur[i] = IloNumArray(env, edge_number_);
 				cplex.getValues(ur[i], u_[i]);
 			}
-
-			if(true) {//TODO
+			if(true) {//TODO meddle with the value of u
 				set_of_utilities_.push_back(ur);
 			}
 
@@ -425,10 +443,45 @@ double Paths::MinimizeLeadersEarning(const vector<double> &q_tariff, const int b
 				os << ur[i] << endl;
 			#endif
 
+			NumMatrix xr(env); xr.setSize(people_n_);
+			FOR(i,people_n_) {
+				xr[i] = IloNumArray(env, edge_number_);
+				cplex.getValues(xr[i], x[i]);
+			}
+
+			#if _DEBUG
+			os << "The solution for x is:\n";
+			FOR(i,people_n_)
+				os << xr[i] << endl;
+			#endif
+
+			#if _DEBUG
+			IloNumArray alpha_p(env, n_); cplex.getValues(alpha_p, alpha_plus);
+			os << "Alpha Plus values are :\n" << alpha_p << "\n";
+			IloNumArray alpha_n(env, n_); cplex.getValues(alpha_n, alpha_negative);
+			os << "Alpha Negativa values are :\n" << alpha_n << "\n";
+
+			
+			IloNumArray betar(env, n_);
+			FOR(i,n_) {
+				if(beta[0].find(i) != beta[0].end()) {
+					IloNumVar refb = beta[0][i];
+					betar[i] = cplex.getValue(refb);
+				}
+				else betar[i] = 0;
+			}
+			os << "Beta values are :\n" << betar << "\n";
+
+			#endif
+
 			obj_value = cplex.getObjValue();
+			#if _DEBUG
+			os << "The objective value is : " << obj_value << "\n";
+			#endif
+
 			}
 			catch(IloAlgorithm::NotExtractedException) {
-				cerr << "IPSOLVE34 VARIABLES ARE NOT RELATED TO THE OBJECTIVE\n"; 
+				cerr << "MinimizeLeadersEarning VARIABLES ARE NOT RELATED TO THE OBJECTIVE\n"; 
 			}
 			break;
 	
@@ -452,24 +505,40 @@ double Paths::MinimizeLeadersEarning(const vector<double> &q_tariff, const int b
 	alpha_negative.end();
 	model.end();
 
+	#if _DEBUG
+    cerr << "\n\n-------MinimizeLeadersEarning END-------" << endl;
+    #endif
+
 	return obj_value;
 }
 
-void Paths::FindingTariffWithFiniteUtilities(const int big_M, std::ostream &os) {
+double Paths::FindingTariffWithFiniteUtilities(const int big_M, std::ostream &os) {
 	//Given a discrete set of utility vectors (set_of_utilities_) it determines the leader's best response
 
 	IloModel model(env);
+	char varname[20]; //Nameing the variables of cplex
+	int bound_flow_binary{2}; //for inequalities with binary constraints bounding the flow type expressions
 
 	// q \in Q
 		model.add(polyhedra_q_);
 
-	IloNumVar Z(env, -IloInfinity, +IloInfinity, ILOFLOAT);
+	sprintf(varname, "z");
+	IloNumVar Z(env, -IloInfinity, +IloInfinity, ILOFLOAT, varname);
 
-	NumVarMatrix x(env, people_n_);
+	#if _DEBUG
+    cerr << "\n\n-------FindingTariffWithFiniteUtilities BEGIN-------" << endl;
+    #endif
+
+	#if _DEBUG
+    cerr << "-------IMPORTED POLYHEDRA U-------" << endl;
+    #endif
+
+	NumVarMatrix x(env, people_n_); //The flow
 	FOR(i,people_n_) {
 		x[i] = IloNumVarArray(env, edge_number_);
 		FOR(j,edge_number_) {
-			x[i][j] = IloNumVar(env, 0., 1., ILOFLOAT);
+			sprintf(varname, "x_%d%d", i, j);
+			x[i][j] = IloNumVar(env, 0., 1., ILOFLOAT, varname);
 		}
 	}
 
@@ -480,8 +549,10 @@ void Paths::FindingTariffWithFiniteUtilities(const int big_M, std::ostream &os) 
 	IloNumVarArray alpha_plus(env, people_n_);
 	IloNumVarArray alpha_negative(env, people_n_);
 	FOR(i,alpha_plus.getSize()) {
-		alpha_plus[i] = IloNumVar(env, 0., +INFINITY, ILOFLOAT);
-		alpha_negative[i] = IloNumVar(env, 0., +INFINITY, ILOFLOAT);
+		sprintf(varname, "ap_%d", i);
+		alpha_plus[i] = IloNumVar(env, 0., +INFINITY, ILOFLOAT, varname);
+		sprintf(varname, "an_%d", i);
+		alpha_negative[i] = IloNumVar(env, 0., +INFINITY, ILOFLOAT, varname);
 
 		//a_plus >= 0 and x_j(\rho(t_j)) >= 1
 			IloExpr expr(env);
@@ -490,10 +561,12 @@ void Paths::FindingTariffWithFiniteUtilities(const int big_M, std::ostream &os) 
 				expr += x[i][g.id(a)];
 			}
 			model.add(expr >= 1);
-			
-			IloNumVar helper(env, 0, 1, ILOINT);
+
+			sprintf(varname, "hap_1_%d", i);
+			IloNumVar helper(env, 0, 1, ILOINT, varname);
 			model.add(alpha_plus[i] <= helper*big_M);
-			model.add(expr-1 <= (1-helper)*big_M);
+			model.add(expr-1 <= (1-helper)*bound_flow_binary);
+			//helper.end();
 			expr.end();
 			
 
@@ -502,14 +575,15 @@ void Paths::FindingTariffWithFiniteUtilities(const int big_M, std::ostream &os) 
 		//a_minus >= 0 and -x_j(\delta(t_j))+1 >= 0
 			IloExpr expr_2(env);
 			//-x_j(\delta(t_j))+1 >= 0
-			for (ListDigraph::OutArcIt a(g, g.nodeFromId(paths_[i].second)); a != INVALID; ++a) {
+			for (ListDigraph::OutArcIt a(g, g.nodeFromId(paths_[i].first)); a != INVALID; ++a) {
 				expr_2 -= x[i][g.id(a)];
 			}
 			model.add(expr_2+1 >= 0);
 			
-			IloNumVar helper_2(env, 0, 1, ILOINT);
+			sprintf(varname, "han_2_%d", i);
+			IloNumVar helper_2(env, 0, 1, ILOINT, varname);
 			model.add(alpha_negative[i] <= helper_2*big_M);
-			model.add(expr_2+1 <= (1-helper_2)*big_M);
+			model.add(expr_2+1 <= (1-helper_2)*bound_flow_binary);
 			expr_2.end();
 			
 
@@ -518,49 +592,67 @@ void Paths::FindingTariffWithFiniteUtilities(const int big_M, std::ostream &os) 
 	#if _DEBUG
     cerr << "-------ALPHAS DEFINED-------" << endl;
     #endif
-
-	NumVarMatrix gamma(env, people_n_);
-	FOR(i,people_n_) {
-		gamma[i] = IloNumVarArray(env, edge_number_);
-		FOR(j,edge_number_) {
-			gamma[i][j] = IloNumVar(env, 0., +IloInfinity, ILOFLOAT);
-			IloNumVar helper(env, 0, 1, ILOINT);
-			model.add(gamma[i][j] <= helper*big_M); //\gamma_{j,e}
-			IloExpr expr_t = 1 - x[i][j];
-			model.add(expr_t <= (1-helper)*big_M); //-x_j(e)+1 \geq 0
-		}
-	}
-
-
-	#if _DEBUG
-    cerr << "-------GAMMA DEFINED-------" << endl;
-    #endif
-	/*
-	IloArray<map<int,IloNumVar>> beta(env, people_n_);
-	FOR(i,people_n_) {
-		FOR(j,n_) {
-			if(paths_[i].first != j && paths_[i].second != j) {
-				//beta[i][j] = IloNumVar(env, 0., +IloInfinity, ILOFLOAT);
-				beta[i].insert({j,IloNumVar(env, 0., +IloInfinity, ILOFLOAT)});
-				IloNumVar helper(env, 0, 1, ILOINT);
-				//model.add
+	
+	vector<map<int,IloNumVar>> beta(people_n_);
+	FOR(j,people_n_) {
+		FOR(v,n_) {
+			ListDigraph::Node curr_v = g.nodeFromId(v);
+			if(paths_[j].first != v && paths_[j].second != v) {
+				sprintf(varname, "b_%d%d", j, v);
+				beta[j][v] = IloNumVar(env, 0., +IloInfinity, ILOFLOAT, varname);
 				
+				IloExpr expr(env);
+				int is_there{0};
+				for(ListDigraph::InArcIt a(g, curr_v); a != INVALID; ++a) {
+					expr += x[j][g.id(a)];
+					++is_there;
+				}
+				for (ListDigraph::OutArcIt a(g, curr_v); a != INVALID; ++a) {
+					expr -= x[j][g.id(a)];
+					++is_there;
+				}
+				if(is_there) {
+					model.add(expr >= 0);
+
+					sprintf(varname, "hb_%d%d", j, v);
+					IloNumVar helper(env, 0, 1, ILOINT, varname);
+					model.add(beta[j][v] <= helper*big_M);
+					model.add(expr <= (1-helper)*bound_flow_binary);
+					//helper.end();
+				}
+				
+				expr.end();
 			}
 		}
 	}
-	*/
+	
 
 	#if _DEBUG
     cerr << "-------BETA DEFINED-------" << endl;
     #endif
+	FOR(i,(int)set_of_utilities_.size()) {
+		FOR(j,people_n_) {
+			FOR(e,edge_number_) {
+				IloExpr expr(env);
+				int source = g.id(g.source(g.arcFromId(e))); int target = g.id(g.target(g.arcFromId(e)));
+				if(target == paths_[j].second) expr += alpha_plus[j];
+				if(source == paths_[j].first) expr -= alpha_negative[j];
 
-	FOR(j,people_n_) {
-		FOR(e,edge_number_) {
-			IloExpr expr(env);
-			expr += alpha_plus[j]- alpha_negative[j] - gamma[j][e];
-			/*Beta*/ 
-			model.add(expr == q_[e]- u_[j][e]);
-			expr.end();
+				if(paths_[j].first != target && paths_[j].second != target) {
+					expr += beta[j][target];
+				}
+				if(paths_[j].first != source && paths_[j].second != source) {
+					expr -= beta[j][source];
+				}
+				expr -= q_[e] + set_of_utilities_[i][j][e];
+				model.add(expr <= 0);
+
+				sprintf(varname, "hdu_%d%d%d", i, j, e);
+				IloNumVar helper(env, 0, 1, ILOINT, varname);
+				model.add(x[j][e] <= helper*bound_flow_binary);
+				model.add(-expr <= (1-helper)*big_M);
+				expr.end();
+			}
 		}
 	}
 
@@ -568,41 +660,123 @@ void Paths::FindingTariffWithFiniteUtilities(const int big_M, std::ostream &os) 
     cerr << "-------DUAL OPTIMALITY DEFINED-------" << endl;
     #endif
 
+	FOR(i,(int)set_of_utilities_.size()) {
+		IloExpr expr(env);
+		FOR(j,people_n_) {
+			FOR(e,edge_number_) {
+				//IloExpr temp_expr(env);
+				//int source = g.id(g.source(g.arcFromId(e))); int target = g.id(g.target(g.arcFromId(e)));
+				//if(target == paths_[j].second) temp_expr += alpha_plus[j];
+				//if(source == paths_[j].first) temp_expr -= alpha_negative[j];
+
+				/*if(paths_[j].first != target && paths_[j].second != target) {
+					temp_expr += beta[j][target];
+				}
+				if(paths_[j].first != source && paths_[j].second != source) {
+					temp_expr -= beta[j][source];
+				}*/
+				
+				//temp_expr -= set_of_utilities_[i][j][e]*x[j][e];
+				//temp_expr -= q_[e] + set_of_utilities_[i][j][e];
+				//expr += temp_expr;
+
+				//temp_expr.end();
+				expr -= set_of_utilities_[i][j][e]*x[j][e];
+			}
+			expr += alpha_plus[j]; expr -= alpha_negative[j];
+		}
+		FOR(e,edge_number_) {
+			expr -= arc_buy_p_[g.arcFromId(e)];
+		}
+		model.add(Z <= expr);
+		expr.end();
+	}
+
 	#if _DEBUG
     cerr << "-------CONSTRAINTS ON Z DEFINED-------" << endl;
     #endif
 
+	IloObjective obj(env, Z, IloObjective::Maximize);
+	model.add(obj);
+
+	#if _DEBUG
+	cerr << "-------OBJECTIVE DEFINED-------" << endl;
+	#endif
 
 	IloCplex cplex(model);
 
 	#if _DEBUG
-    cplex.exportModel("problem_3_4.lp");
+    cplex.exportModel("PROBLEM_FindingTariffWithFiniteUtilities.lp");
     #endif
 
 	cplex.solve();
-	if(cplex.getStatus() == IloAlgorithm::Optimal) {
-		
-		try{
-			NumMatrix ur(env); ur.setSize(people_n_);
-			FOR(i,people_n_) {
-				ur[i] = IloNumArray(env, edge_number_);
-				cplex.getValues(ur[i], u_[i]);
-			}
+	double obj_value{0};
+	switch (cplex.getStatus())
+	{
 
-			if(true) {//TODO
-				set_of_utilities_.push_back(ur);
+		case IloAlgorithm::Optimal:
+			try{
+			NumMatrix xr(env); xr.setSize(people_n_);
+			FOR(i,people_n_) {
+				xr[i] = IloNumArray(env, edge_number_);
+				cplex.getValues(xr[i], x[i]);
 			}
 
 			#if _DEBUG
-			os << "The solution for u is:\n";
+			os << "The solution for x is:\n";
 			FOR(i,people_n_)
-				os << ur[i] << endl;
+				os << xr[i] << endl;
 			#endif
-		}
-		catch(IloAlgorithm::NotExtractedException) {
-			cerr << "IPSOLVE34 VARIABLES ARE NOT RELATED TO THE OBJECTIVE\n"; 
-		}
-    }
+
+			IloNumArray qr(env, edge_number_);
+			cplex.getValues(qr, q_);
+			#if _DEBUG
+			os << "The solution for q is:\n";
+			os << qr << endl;
+			#endif
+
+			#if _DEBUG
+			IloNumArray alpha_p(env, n_); cplex.getValues(alpha_p, alpha_plus);
+			os << "Alpha Plus values are :\n" << alpha_p << "\n";
+			IloNumArray alpha_n(env, n_); cplex.getValues(alpha_n, alpha_negative);
+			os << "Alpha Negativa values are :\n" << alpha_n << "\n";
+
+			
+			IloNumArray betar(env, n_);
+			FOR(i,n_) {
+				if(beta[0].find(i) != beta[0].end()) {
+					IloNumVar refb = beta[0][i];
+					betar[i] = cplex.getValue(refb);
+				}
+				else betar[i] = 0;
+			}
+			os << "Beta values are :\n" << betar << "\n";
+
+			#endif
+			
+			obj_value = cplex.getObjValue();
+			#if _DEBUG
+			os << "Maximum objective value is: " << cplex.getObjValue();
+			#endif
+			}
+			catch(IloAlgorithm::NotExtractedException) {
+				cerr << "IPSOLVE34 VARIABLES ARE NOT RELATED TO THE OBJECTIVE\n"; 
+			}
+			break;
+	
+		case IloAlgorithm::Unbounded:
+			os << "THE PROBLEM IS UNBOUNDED:\n";
+			break;
+		case IloAlgorithm::Infeasible:
+			os << "THE PROBLEM IS Infeasible:\n";
+			break;
+		
+		case IloAlgorithm::Error:
+			os << "THE PROBLEM HAS Error:\n";
+			break;
+	
+	}
+
 
 	Z.end();
 	//expr_obj.end();
@@ -611,22 +785,44 @@ void Paths::FindingTariffWithFiniteUtilities(const int big_M, std::ostream &os) 
 	alpha_plus.end();
 	alpha_negative.end();
 	model.end();
+
+	return obj_value;
+
+	#if _DEBUG
+    cerr << "\n\n-------FindingTariffWithFiniteUtilities END-------" << endl;
+    #endif
 }
 
 void Paths::FindingOptimalCost(std::ostream &os) {
 	//Getting an initial q value saving it in arc_cost_q_
-		InitialQValue();
-	
-	//Section 3.4. Solver Finding worst case for leader
 		vector<double> q_tariff;
+		InitialQValue(q_tariff);
+		/*
 		for (ListDigraph::ArcIt e(g); e != INVALID; ++e) {
+			#if _DEBUG
+			os << "The id of the current vector: " << g.id(e) << "\n";
+			#endif
 			q_tariff.push_back(arc_cost_q_[e]);
 		}
-		int big_M = 300;
-		double leader_earn = MinimizeLeadersEarning(q_tariff, big_M); //hyperparam TODO to-tune
+		#if _DEBUG
+		os << "After playing in vector q_tariff:\n";
+		Print_vector(q_tariff, os);
+		#endif
+		*/
 	
-	//Section 3.5.
-		//FindingTariffWithFiniteUtilities(big_M);
+	int iteration{1};
+	FOR(i,iteration) {
+		//Petrubate q_tariff
+			PerturbationOfq(q_tariff, 0.05);
+
+		//Section 3.4. Solver Finding worst case for leader
+			int big_M = 300;
+			double leader_earn = MinimizeLeadersEarning(q_tariff, big_M); //hyperparam TODO to-tune
+			leader_max_earn_ = std::max(leader_earn, leader_max_earn_);
+		
+		//Section 3.5.
+			FindingTariffWithFiniteUtilities(big_M);
+	}
 }
 
 void Paths::PrintData(std::ostream &os) const {
